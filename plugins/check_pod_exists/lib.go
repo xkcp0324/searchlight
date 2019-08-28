@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"encoding/json"
 	"github.com/appscode/go/flags"
 	"github.com/appscode/searchlight/pkg/icinga"
 	"github.com/appscode/searchlight/plugins"
@@ -96,19 +97,40 @@ func (p *plugin) Check() (icinga.State, interface{}) {
 		totalPod = len(podList.Items)
 	}
 
+	var state icinga.State
+	mapIns := make(map[string]interface{})
+	mapIns["checkType"] = "pod-exists"
+	mapIns["selector"] = opts.selector
+	mapIns["alertCount"] = opts.count
+	mapIns["current"] = totalPod
+
 	if opts.isCountSet {
-		if opts.count != totalPod {
-			return icinga.Critical, fmt.Sprintf("Found %d pod(s) instead of %d", totalPod, opts.count)
+		if totalPod > opts.count {
+			state = icinga.Critical
+			mapIns["message"] = fmt.Sprintf("Found %d pod(s) instead of %d", totalPod, opts.count)
+		} else if totalPod < opts.count {
+			state = icinga.Critical
+			mapIns["message"] = fmt.Sprintf("Found %d pod(s) instead of %d", totalPod, opts.count)
 		} else {
-			return icinga.OK, "Found all pods"
+			state = icinga.OK
+			mapIns["message"] = "Found all pods"
 		}
 	} else {
 		if totalPod == 0 {
-			return icinga.Critical, "No pod found"
+			state = icinga.Critical
+			mapIns["message"] = "No pod found"
 		} else {
-			return icinga.OK, fmt.Sprintf("Found %d pods(s)", totalPod)
+			state = icinga.OK
+			mapIns["message"] = fmt.Sprintf("Found %d pods(s)", totalPod)
 		}
 	}
+
+	jsonByte, err := json.Marshal(mapIns)
+	if err != nil {
+		return state, ""
+	}
+
+	return state, string(jsonByte)
 }
 
 const (

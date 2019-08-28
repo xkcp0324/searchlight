@@ -10,22 +10,30 @@ import (
 	"github.com/appscode/searchlight/pkg/icinga"
 	"github.com/appscode/searchlight/plugins"
 	"github.com/spf13/cobra"
+	apiv1 "k8s.io/api/core/v1"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"kmodules.xyz/client-go/tools/clientcmd"
 )
 
 type plugin struct {
-	client  corev1.EventInterface
-	options options
+	client    corev1.EventInterface
+	podClient corev1.PodInterface
+	options   options
 }
 
 var _ plugins.PluginInterface = &plugin{}
 
-func newPlugin(client corev1.EventInterface, opts options) *plugin {
-	return &plugin{client, opts}
+func newPlugin(client kubernetes.Interface, opts options) *plugin {
+	return &plugin{
+		client:    client.CoreV1().Events(opts.namespace),
+		podClient: client.CoreV1().Pods(opts.namespace),
+		options:   opts,
+	}
 }
 
 func newPluginFromConfig(opts options) (*plugin, error) {
@@ -34,7 +42,7 @@ func newPluginFromConfig(opts options) (*plugin, error) {
 		return nil, err
 	}
 
-	return newPlugin(client.CoreV1().Events(opts.namespace), opts), nil
+	return newPlugin(client, opts), nil
 }
 
 type options struct {
@@ -88,17 +96,49 @@ func (o *options) validate() error {
 }
 
 type eventInfo struct {
-	Name      string `json:"name,omitempty"`
-	Namespace string `json:"namespace,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	Count     int32  `json:"count,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-	Message   string `json:"message,omitempty"`
+	SourceComponent string `json:"sourceComponent,omitempty"`
+	SourceHost      string `json:"sourceHost,omitempty"`
+	Name            string `json:"name,omitempty"`
+	Namespace       string `json:"namespace,omitempty"`
+	Kind            string `json:"kind,omitempty"`
+	Count           int32  `json:"count,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	Message         string `json:"message,omitempty"`
 }
 
 type serviceOutput struct {
-	Events  []*eventInfo `json:"events,omitempty"`
-	Message string       `json:"message,omitempty"`
+	Events    []*eventInfo `json:"events,omitempty"`
+	Message   string       `json:"message,omitempty"`
+	CheckType string       `json:"checkType,omitempty"`
+}
+
+func isReadyOrSucceeded(pod apiv1.Pod) bool {
+	if pod.Status.Phase == apiv1.PodSucceeded {
+		return true
+	}
+	if pod.Status.Phase == apiv1.PodRunning {
+		for _, c := range pod.Status.Conditions {
+			if c.Type == apiv1.PodReady {
+				if c.Status == apiv1.ConditionFalse {
+					return false
+				}
+			}
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func isReadyOrSucceededByPodUID(UID types.UID, pods []apiv1.Pod) (string, bool) {
+	for _, pod := range pods {
+		if pod.UID == UID && isReadyOrSucceeded(pod) {
+			return pod.Name, true
+		}
+	}
+
+	return "", false
 }
 
 func (p *plugin) Check() (icinga.State, interface{}) {
@@ -131,19 +171,30 @@ func (p *plugin) Check() (icinga.State, interface{}) {
 		FieldSelector: fs.String(),
 	})
 	if err != nil {
-		return icinga.Unknown, err
+		return icinga.Unknown, fmt.Sprintf("List namespace:%s event err:%#v", p.options.namespace, err)
+	}
+
+	podList, err := p.podClient.List(metav1.ListOptions{})
+	if err != nil {
+		return icinga.Unknown, fmt.Sprintf("List namespace:%s pod err:%#v", p.options.namespace, err)
 	}
 
 	for _, event := range eventList.Items {
 		if checkTime.Before(event.LastTimestamp.Time) {
+			if _, ok := isReadyOrSucceededByPodUID(event.UID, podList.Items); ok {
+				continue
+			}
+
 			eventInfoList = append(eventInfoList,
 				&eventInfo{
-					Name:      event.InvolvedObject.Name,
-					Namespace: event.InvolvedObject.Namespace,
-					Kind:      event.InvolvedObject.Kind,
-					Count:     event.Count,
-					Reason:    event.Reason,
-					Message:   event.Message,
+					SourceComponent: event.Source.Component,
+					SourceHost:      event.Source.Host,
+					Name:            event.InvolvedObject.Name,
+					Namespace:       event.InvolvedObject.Namespace,
+					Kind:            event.InvolvedObject.Kind,
+					Count:           event.Count,
+					Reason:          event.Reason,
+					Message:         event.Message,
 				},
 			)
 		}
@@ -153,10 +204,17 @@ func (p *plugin) Check() (icinga.State, interface{}) {
 		return icinga.OK, "All events look Normal"
 	} else {
 		output := &serviceOutput{
-			Events:  eventInfoList,
-			Message: fmt.Sprintf("Found %d Warning event(s)", len(eventInfoList)),
+			Message:   fmt.Sprintf("Found %d Warning event(s)", len(eventInfoList)),
+			CheckType: "event",
 		}
-		outputByte, err := json.MarshalIndent(output, "", "  ")
+
+		if len(eventInfoList) > 4 {
+			output.Events = eventInfoList[:4]
+		} else {
+			output.Events = eventInfoList
+		}
+
+		outputByte, err := json.Marshal(output)
 		if err != nil {
 			return icinga.Unknown, err
 		}

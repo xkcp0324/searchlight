@@ -58,13 +58,15 @@ func (o *options) validate() error {
 }
 
 type objectInfo struct {
-	Name   string `json:"name,omitempty"`
-	Status string `json:"status,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type serviceOutput struct {
-	Objects []*objectInfo `json:"objects,omitempty"`
-	Message string        `json:"message,omitempty"`
+	Objects   []*objectInfo `json:"objects,omitempty"`
+	Message   string        `json:"message,omitempty"`
+	CheckType string        `json:"checkType,omitempty"`
 }
 
 func (p *plugin) Check() (icinga.State, interface{}) {
@@ -91,8 +93,9 @@ func (p *plugin) Check() (icinga.State, interface{}) {
 			if condition.Type == core.ComponentHealthy && condition.Status == core.ConditionFalse {
 				objectInfoList = append(objectInfoList,
 					&objectInfo{
-						Name:   component.Name,
-						Status: "Unhealthy",
+						Name:    component.Name,
+						Status:  "Unhealthy",
+						Message: condition.Message,
 					},
 				)
 			}
@@ -103,14 +106,16 @@ func (p *plugin) Check() (icinga.State, interface{}) {
 		return icinga.OK, "All components are healthy"
 	} else {
 		output := &serviceOutput{
-			Objects: objectInfoList,
-			Message: fmt.Sprintf("%d unhealthy component(s)", len(objectInfoList)),
+			Objects:   objectInfoList,
+			Message:   fmt.Sprintf("%d unhealthy component(s)", len(objectInfoList)),
+			CheckType: "component-status",
 		}
-		outputByte, err := json.MarshalIndent(output, "", "  ")
+
+		outputByte, err := json.Marshal(output)
 		if err != nil {
 			return icinga.Unknown, err
 		}
-		return icinga.Critical, outputByte
+		return icinga.Critical, string(outputByte)
 	}
 }
 

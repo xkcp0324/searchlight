@@ -4,25 +4,33 @@ import (
 	"encoding/json"
 	"errors"
 
+	"fmt"
 	"github.com/appscode/go/flags"
 	"github.com/appscode/searchlight/pkg/icinga"
 	"github.com/appscode/searchlight/plugins"
 	"github.com/spf13/cobra"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"kmodules.xyz/client-go/tools/clientcmd"
 )
 
 type plugin struct {
-	client  corev1.NodeInterface
-	options options
+	client    corev1.NodeInterface
+	podClient corev1.PodInterface
+	options   options
 }
 
 var _ plugins.PluginInterface = &plugin{}
 
-func newPlugin(client corev1.NodeInterface, opts options) *plugin {
-	return &plugin{client, opts}
+func newPlugin(client kubernetes.Interface, opts options) *plugin {
+	return &plugin{
+		client:    client.CoreV1().Nodes(),
+		podClient: client.CoreV1().Pods(metav1.NamespaceAll),
+		options:   opts,
+	}
 }
 
 func newPluginFromConfig(opts options) (*plugin, error) {
@@ -30,7 +38,7 @@ func newPluginFromConfig(opts options) (*plugin, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newPlugin(client.CoreV1().Nodes(), opts), nil
+	return newPlugin(client, opts), nil
 }
 
 type options struct {
@@ -71,21 +79,57 @@ func (o *options) validate() error {
 	return nil
 }
 
+type Allocatable struct {
+	Cpu    string `json:"cpu"`
+	Memory string `json:"memory"`
+	Pods   int64  `json:"pods"`
+}
+
+type Capacity struct {
+	Cpu    string `json:"cpu"`
+	Memory string `json:"memory"`
+	Pods   int64  `json:"pods"`
+}
+
 type message struct {
+	CheckType          string               `json:"checkType,omitempty"`
+	NodeName           string               `json:"nodeName,omitempty"`
 	Ready              core.ConditionStatus `json:"ready,omitempty"`
 	OutOfDisk          core.ConditionStatus `json:"outOfDisk,omitempty"`
 	MemoryPressure     core.ConditionStatus `json:"memoryPressure,omitempty"`
 	DiskPressure       core.ConditionStatus `json:"diskPressure,omitempty"`
 	NetworkUnavailable core.ConditionStatus `json:"networkUnavailable,omitempty"`
+	CpuUsagePercent    string               `json:"cpuUsagePercent,omitempty"`
+	MemoryUsagePercent string               `json:"memoryUsagePercent,omitempty"`
+	Capacity           *Capacity            `json:"capacity,omitempty"`
+	Allocatable        *Allocatable         `json:"allocatable,omitempty"`
 }
 
 func (p *plugin) Check() (icinga.State, interface{}) {
 	node, err := p.client.Get(p.options.nodeName, metav1.GetOptions{})
 	if err != nil {
+		fmt.Printf("get node:%s err:%#v", p.options.nodeName, err)
 		return icinga.Unknown, err
 	}
 
-	msg := message{}
+	fieldSelector, err := fields.ParseSelector(fmt.Sprintf("spec.nodeName=%s", p.options.nodeName))
+	if err != nil {
+		fmt.Printf("ParseSelector node:%s err:%#v", p.options.nodeName, err)
+		return icinga.Unknown, err
+	}
+
+	podList, err := p.podClient.List(metav1.ListOptions{FieldSelector: fieldSelector.String()})
+	if err != nil {
+		fmt.Printf("list node:%s pod err:%#v", p.options.nodeName, err)
+		return icinga.Unknown, err
+	}
+
+	msg := message{
+		Allocatable: &Allocatable{},
+		Capacity:    &Capacity{},
+	}
+	msg.CheckType = "node-status"
+	msg.NodeName = p.options.nodeName
 	for _, condition := range node.Status.Conditions {
 		switch condition.Type {
 		case core.NodeReady:
@@ -111,7 +155,14 @@ func (p *plugin) Check() (icinga.State, interface{}) {
 		state = icinga.Critical
 	} else if msg.Ready == core.ConditionUnknown {
 		state = icinga.Unknown
+	} else {
+		state = icinga.OK
 	}
+
+	msg.CpuUsagePercent, msg.Capacity.Cpu, msg.Allocatable.Cpu = CalculateNodeResourceUsage(core.ResourceCPU, node, podList.Items)
+	msg.MemoryUsagePercent, msg.Capacity.Memory, msg.Allocatable.Memory = CalculateNodeResourceUsage(core.ResourceMemory, node, podList.Items)
+	msg.Capacity.Pods = node.Status.Capacity.Pods().Value()
+	msg.Allocatable.Pods = node.Status.Allocatable.Pods().Value()
 
 	output, err := json.MarshalIndent(msg, "", " ")
 	if err != nil {
